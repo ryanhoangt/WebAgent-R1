@@ -2,66 +2,105 @@
 Adopted from https://github.com/zeno-ml/zeno-build/"""
 
 import asyncio
+import json
 import logging
+import math
 import os
 import random
 import time
 from typing import Any
+from contextvars import ContextVar
 
 import aiolimiter
+import httpx
 import openai
 from openai import AsyncOpenAI, OpenAI
 
 base_url = os.environ.get("OPENAI_API_URL")
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url=base_url)
-aclient = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url=base_url)
+# Retry in this module only, rather than multiplying SDK and outer retries.
+CLIENT_OPTIONS = {
+    "timeout": float(os.environ.get("LLM_REQUEST_TIMEOUT", "180")),
+    "max_retries": 0,
+}
+_request_deadline = ContextVar("llm_request_deadline", default=None)
+
+
+def get_client_options():
+    options = dict(CLIENT_OPTIONS)
+    deadline = _request_deadline.get()
+    if deadline is not None:
+        options["timeout"] = min(options["timeout"], max(0.001, deadline - time.monotonic()))
+    return options
+
+
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url=base_url, **get_client_options())
+aclient = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url=base_url, **get_client_options())
 from tqdm.asyncio import tqdm_asyncio
 
 
 def retry_with_exponential_backoff(  # type: ignore
     func,
-    initial_delay: float = 1,
+    initial_delay: float = 30,
     exponential_base: float = 2,
     jitter: bool = True,
-    max_retries: int = 3,
+    max_retries: int = 20,
     errors: tuple[Any] = (
         openai.RateLimitError,
-        openai.BadRequestError,
         openai.InternalServerError,
+        openai.APIConnectionError,
     ),
 ):
     """Retry a function with exponential backoff."""
 
     def wrapper(*args, **kwargs):  # type: ignore
-        # Initialize variables
         num_retries = 0
-        delay = initial_delay
-        # Loop until a successful response or max_retries is hit or an exception is raised
-        while True:
-            try:
-
-                return func(*args, **kwargs)
-
-            # Retry on specified errors
-            except errors as e:
-                # Increment retries
-                num_retries += 1
-
-                # Check if max retries has been reached
-                if num_retries > max_retries:
-                    raise Exception(
-                        f"Maximum number of retries ({max_retries}) exceeded."
+        delay = float(os.environ.get("LLM_RETRY_INITIAL_DELAY", str(initial_delay)))
+        max_delay = float(os.environ.get("LLM_RETRY_MAX_DELAY", "120"))
+        window = float(os.environ.get("LLM_RETRY_WINDOW", "1800"))
+        retry_limit = int(os.environ.get("LLM_MAX_RETRIES", str(max_retries)))
+        if retry_limit < 0 or any(not math.isfinite(v) or v <= 0 for v in (delay, max_delay, window)):
+            raise ValueError("Invalid LLM retry policy: retries must be non-negative and delays/window positive and finite")
+        started = time.monotonic()
+        deadline = started + window
+        token = _request_deadline.set(deadline)
+        last_error = None
+        logger = logging.getLogger("logger")
+        try:
+            while True:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"LLM retry window ({window:g}s) exhausted after {num_retries} attempts: {last_error}"
+                    ) from last_error
+                try:
+                    result = func(*args, **kwargs)
+                    if num_retries:
+                        logger.info("LLM recovered after %d retries (%.1fs); continuing the current task",
+                                    num_retries, time.monotonic() - started)
+                    return result
+                except openai.APIError as e:
+                    status = getattr(e, "status_code", None)
+                    retryable = (isinstance(e, errors) or status in (408, 409)
+                                 or (status == 404 and "ERR_NGROK_3200" in str(e)))
+                    if not retryable:
+                        raise  # Bad credentials, invalid requests and missing models need a fix.
+                    num_retries += 1
+                    last_error = e
+                    remaining = deadline - time.monotonic()
+                    if num_retries > retry_limit or remaining <= 0:
+                        raise RuntimeError(
+                            f"LLM request failed after {num_retries} attempts: "
+                            f"{type(e).__name__} (HTTP {status}): {e}"
+                        ) from e
+                    wait = min(max_delay, delay * (1 + 0.2 * random.random() if jitter else 1), remaining)
+                    logger.warning(
+                        "LLM unavailable: %s (HTTP %s): %s; retry %d/%d in %.1fs (%.0fs retry window remaining)",
+                        type(e).__name__, status, str(e).replace("\n", " ")[:400],
+                        num_retries, retry_limit, wait, remaining,
                     )
-
-                # Increment the delay
-                delay *= exponential_base * (1 + jitter * random.random())
-
-                # Sleep for the delay
-                time.sleep(delay)
-
-            # Raise exceptions for any errors not specified
-            except Exception as e:
-                raise e
+                    time.sleep(wait)
+                    delay = min(max_delay, delay * exponential_base)
+        finally:
+            _request_deadline.reset(token)
 
     return wrapper
 
@@ -153,10 +192,10 @@ def generate_from_openai_completion(
         raise ValueError(
             "OPENAI_API_KEY environment variable must be set when using OpenAI API."
         )
-    if api_key is not None:
-        client = OpenAI(api_key=api_key, base_url=base_url)
+    request_client = (OpenAI(api_key=api_key, base_url=base_url, **get_client_options())
+                      if api_key is not None else client.with_options(**get_client_options()))
         
-    response = client.completions.create(
+    response = request_client.completions.create(
         prompt=prompt,
         model=model,
         temperature=temperature,
@@ -246,6 +285,61 @@ async def agenerate_from_openai_chat_completion(
     return [x["choices"][0]["message"]["content"] for x in responses]
 
 
+def _collect_chat_stream(stream) -> str:
+    """Return only a completed answer; never expose partial output to the agent."""
+    logger = logging.getLogger("logger")
+    started = last_log = time.monotonic()
+    content = []
+    content_chars = reasoning_chars = 0
+    first_token = False
+    finish_reason = None
+    request = stream.response.request
+    logger.info("LLM stream opened; waiting for generated text")
+    try:
+        with stream:
+            for chunk in stream:
+                now = time.monotonic()
+                deadline = _request_deadline.get()
+                if deadline is not None and now >= deadline:
+                    raise openai.APITimeoutError(request=request)
+                for choice in chunk.choices:
+                    if choice.index != 0:
+                        continue
+                    delta = choice.delta
+                    text = delta.content or ""
+                    reasoning = (getattr(delta, "reasoning_content", None)
+                                 or getattr(delta, "reasoning", None) or "")
+                    content.append(text)
+                    content_chars += len(text)
+                    reasoning_chars += len(reasoning)
+                    if not first_token and (text or reasoning):
+                        logger.info("LLM stream first text after %.1fs", now - started)
+                        first_token = True
+                    if choice.finish_reason is not None:
+                        finish_reason = choice.finish_reason
+                if now - last_log >= 30:
+                    logger.info("LLM stream active: %.1fs; reasoning_chars=%d; content_chars=%d",
+                                now - started, reasoning_chars, content_chars)
+                    last_log = now
+        if finish_reason is None:
+            raise openai.APIConnectionError(
+                message="LLM stream ended without finish_reason; discarding partial response",
+                request=request,
+            )
+    except httpx.TimeoutException as exc:
+        # The SDK wraps request setup errors, but raw httpx errors can escape
+        # while iterating the body. Normalize them for the existing retry policy.
+        raise openai.APITimeoutError(request=request) from exc
+    except httpx.TransportError as exc:
+        raise openai.APIConnectionError(
+            message=f"LLM stream interrupted ({type(exc).__name__}); discarding partial response",
+            request=request,
+        ) from exc
+    logger.info("LLM stream finished: %.1fs; finish_reason=%s; reasoning_chars=%d; content_chars=%d",
+                time.monotonic() - started, finish_reason, reasoning_chars, content_chars)
+    return "".join(content)
+
+
 @retry_with_exponential_backoff
 def generate_from_openai_chat_completion(
     messages: list[dict[str, str]],
@@ -264,25 +358,45 @@ def generate_from_openai_chat_completion(
             "OPENAI_API_KEY environment variable must be set when using OpenAI API."
         )
     
-    if api_key is not None:
-        client = OpenAI(api_key=api_key, base_url=base_url)
-    
+    request_client = (OpenAI(api_key=api_key, base_url=base_url, **get_client_options())
+                      if api_key is not None else client.with_options(**get_client_options()))
+    actor_url = os.environ.get("OPENAI_API_URL")
+    is_actor = (base_url or str(request_client.base_url)).rstrip("/") == (actor_url or "").rstrip("/")
+    stream_value = os.environ.get("LLM_STREAM", "false").lower()
+    if stream_value not in ("true", "false", "1", "0"):
+        raise ValueError("LLM_STREAM must be true/false or 1/0")
+    streaming = is_actor and stream_value in ("true", "1")
+    stream_options = {"stream": True} if streaming else {}
     if model in ['o3-mini', 'o3', 'o4-mini']:
-        response = client.chat.completions.create(
+        response = request_client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temperature,
             max_completion_tokens=max_tokens,
+            **stream_options,
             # top_p=top_p,
         )
     else:
-        response = client.chat.completions.create(
+        # Optional settings for OpenAI-compatible servers such as vLLM.
+        request_options = {}
+        if (os.environ.get("OPENAI_CHAT_TEMPLATE_KWARGS")
+                and base_url == os.environ.get("OPENAI_API_URL")):
+            request_options["extra_body"] = {
+                "chat_template_kwargs": json.loads(
+                    os.environ["OPENAI_CHAT_TEMPLATE_KWARGS"]
+                )
+            }
+        response = request_client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
+            **stream_options,
+            **request_options,
         )
+    if streaming:
+        return _collect_chat_stream(response)
     answer: str = response.choices[0].message.content
     return answer
 

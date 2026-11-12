@@ -26,7 +26,7 @@
         "url": "last",
         "locator": "document.querySelector('[id=\"notes-list\"').lastElementChild.querySelector('.timeline-discussion-body').outerText",
         "required_contents": {
-          "must_include": "Good idea"
+          "must_include": ["Good idea"]
         }
       }
     ]

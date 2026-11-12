@@ -139,8 +139,11 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
     def setup(self, config_file: Path | None = None) -> None:
         self.context_manager = sync_playwright()
         self.playwright = self.context_manager.__enter__()
+        browser_args = json.loads(os.environ.get('WEB_ARENA_BROWSER_ARGS', '[]'))
+        if not isinstance(browser_args, list) or not all(isinstance(arg, str) for arg in browser_args):
+            raise ValueError('WEB_ARENA_BROWSER_ARGS must be a JSON array of strings')
         self.browser = self.playwright.chromium.launch(
-            headless=self.headless, slow_mo=self.slow_mo
+            headless=self.headless, slow_mo=self.slow_mo, args=browser_args
         )
 
         if config_file:

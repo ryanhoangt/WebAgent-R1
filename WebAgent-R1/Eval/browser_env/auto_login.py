@@ -121,12 +121,13 @@ def renew_comb(comb: list[str], auth_folder: str = "./.auth") -> None:
     if "gitlab" in comb:
         username = ACCOUNTS["gitlab"]["username"]
         password = ACCOUNTS["gitlab"]["password"]
-        page.goto(f"{GITLAB}/users/sign_in")
+        # The first Rails requests after a local GitLab reset can exceed 30s.
+        page.goto(f"{GITLAB}/users/sign_in", timeout=120000)
         page.get_by_test_id("username-field").click()
         page.get_by_test_id("username-field").fill(username)
         page.get_by_test_id("username-field").press("Tab")
         page.get_by_test_id("password-field").fill(password)
-        page.get_by_test_id("sign-in-button").click()
+        page.get_by_test_id("sign-in-button").click(timeout=120000)
 
     context.storage_state(path=f"{auth_folder}/{'.'.join(comb)}_state.json")
 

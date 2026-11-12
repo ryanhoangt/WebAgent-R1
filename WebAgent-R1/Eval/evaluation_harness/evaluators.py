@@ -2,6 +2,7 @@
 # answer string match
 import importlib
 import json
+import logging
 import re
 import time
 import urllib
@@ -475,6 +476,13 @@ class HTMLContentExactEvaluator(Evaluator):
                 
                 assert isinstance(required_contents, list)
                 reference = ', '.join(required_contents)
+                # A nonempty required post/content cannot match an absent element
+                # or empty extracted text. Avoid asking the judge about no evidence.
+                if isinstance(selected_element, str) and not selected_element.strip() and reference.strip():
+                    logging.getLogger("logger").info(
+                        "HTML fuzzy check: empty extracted content with a nonempty reference; score=0")
+                    score = 0.0
+                    break
                 score *= self.fuzzy_match(
                     ref=reference, pred=selected_element, intent=intent
                 )

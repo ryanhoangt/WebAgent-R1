@@ -579,8 +579,20 @@ def gitlab_get_project_memeber_role(
     return role
 
 @beartype
+def get_judge_config() -> dict[str, str]:
+    """Allow an evaluator model/API separate from the browser agent's model/API."""
+    return {
+        "model": os.environ.get("EVAL_JUDGE_MODEL", "gpt-4-1106-preview"),
+        "api_key": os.environ.get("EVAL_JUDGE_API_KEY", os.environ["OPENAI_API_KEY"]),
+        "base_url": os.environ.get(
+            "EVAL_JUDGE_API_URL",
+            os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1"),
+        ),
+    }
+
+
 def llm_fuzzy_match(pred: str, reference: str, question: str) -> float:
-    """Check whether the prediction matches the reference with GPT-4-turbo"""
+    """Check semantic equivalence using the configured evaluator model."""
     messages: list[dict[str, Any]] = []
     # construct the question to ask
     message = "Help a teacher to grade the answer of a student given a question. Keep in mind that the student may use different phrasing or wording to answer the question. The goal is to evaluate whether the answer is semantically equivalent to the reference answer.\n"
@@ -597,25 +609,33 @@ def llm_fuzzy_match(pred: str, reference: str, question: str) -> float:
     logger.info(f'[R] {reference}')
     logger.info(f'[P] {pred}')
 
-    response = generate_from_openai_chat_completion(
-        model="gpt-4-1106-preview",  # gpt-4-1106-preview unavailable
-        messages=messages,
-        temperature=0,
-        max_tokens=768,
-        top_p=1.0,
-        context_length=0,
-        api_key=os.environ["OPENAI_API_KEY"],
-        base_url=os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1"),
-    ).lower()
-    if "partially correct" in response or "incorrect" in response:
-        return 0.0
-    else:
-        assert "correct" in response, response
-        return 1.0
+    for attempt in range(3):
+        response = generate_from_openai_chat_completion(
+            **get_judge_config(),
+            messages=messages,
+            temperature=0,
+            max_tokens=768,
+            top_p=1.0,
+            context_length=0,
+        )
+        # Accept only the requested labels, not substrings such as "not correct".
+        verdict = response.strip().lower().rstrip('.').strip() if isinstance(response, str) else ''
+        if verdict in {"correct", "incorrect", "partially correct"}:
+            return float(verdict == "correct")
+        logger.warning("Fuzzy judge returned an invalid verdict (%d/3): %r",
+                       attempt + 1, str(response)[:160])
+        if attempt < 2:
+            messages.extend([
+                {"role": "assistant", "content": response or ""},
+                {"role": "user", "content": "Your verdict must be exactly one of: correct, incorrect, partially correct. "
+                 "Evaluate the original student answer against the original reference. "
+                 "Do not output N/A or any explanation."},
+            ])
+    raise RuntimeError("Fuzzy judge returned invalid verdicts after 3 attempts; task remains unscored.")
 
 
 def llm_ua_match(pred: str, reference: str, question: str) -> float:
-    """Check whether the prediction matches the reference with GPT-4-turbo"""
+    """Check an unachievable answer using the configured evaluator model."""
     messages: list[dict[str, Any]] = []
     # construct the question to ask
     message = ""
@@ -635,14 +655,12 @@ def llm_ua_match(pred: str, reference: str, question: str) -> float:
     ]
 
     response = generate_from_openai_chat_completion(
-        model="gpt-4-1106-preview", # gpt-4-1106-preview not available
+        **get_judge_config(),
         messages=messages,
         temperature=0,
         max_tokens=768,
         top_p=1.0,
         context_length=0,
-        api_key=os.environ["OPENAI_API_KEY"],
-        base_url=os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1"),
     ).lower()
     if "different" in response:
         return 0.0
